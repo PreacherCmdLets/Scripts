@@ -1,0 +1,211 @@
+############################################################################
+# Function ConnectionString : To connect to Src and Target server
+# Parameters: ServerName and DbName
+###########################################################################
+
+Function ConnectionString([string] $ServerName, [string] $DbName)
+{
+"Data Source=$ServerName;Initial Catalog=$DbName;Integrated Security=True;"
+}
+
+###########################################################################
+# Function Rm_Fk_Constraints : Find Fk constraints , create and drop DDL files
+# Parameters: ServerName , DbName and TbName
+###########################################################################
+
+Function Rm_Fk_Constraints ([string] $SrcServerName, [string] $DesServerName,[string] $DbName ,[string] $TbName)
+{
+$Stamp = Get-Date -Format "yyyy_MM_dd_HHmmss" ;
+$FileCreateDDL = $('{0}\Create_and_Drop_Constraints_{1}_{2}.sql' -f '\\<SharedPath>\D\SQLScripts\TablesRefresh\',$TbName, $Stamp ) ;
+
+$dataAdapter = New-Object System.Data.SqlClient.SqlDataAdapter
+$dotindex = $TbName.Indexof(".")
+$trimtable = $TbName.Substring( $TbName.LastIndexOf(".")+1)
+$trimtable
+
+
+$Drop_Create_query = "
+SET NOCOUNT ON
+
+DECLARE @Drop_Create Table -- feel free to use a permanent table
+(
+  drop_script NVARCHAR(MAX),
+  create_script NVARCHAR(MAX)
+);
+  
+DECLARE @drop   NVARCHAR(MAX) = N'',
+        @create NVARCHAR(MAX) = N'',
+              @tablename varchar(100) = '$trimtable';
+
+-- drop is easy, just build a simple concatenated list from sys.foreign_keys:
+SELECT @create += N' ALter Table ' + schema_name(t1.schema_id) +'.'+ object_name(fkc.parent_object_id) 
+ + ' WITH NOCHECK  Add Constraint ' + fk.name +   ' FOREIGN KEY (' + c1.name +') REFERENCES '+  schema_name(t1.schema_id) +'.'+ object_name(fkc.referenced_object_id) + ' ('+ c2.name +');'
+,
+       @drop += N' ALter Table ' + schema_name(t1.schema_id) +'.'+ object_name(fkc.parent_object_id) + ' Drop Constraint ' + fk.name 
+ from --sys.tables t inner join 
+  sys.foreign_keys fk 
+  inner join sys.foreign_key_columns fkc on fk.object_id=fkc.constraint_object_id
+  inner join sys.columns c1 on c1.object_id=fkc.parent_object_id and c1.column_id=fkc.parent_column_id 
+  inner join sys.columns c2 on c2.object_id=fkc.referenced_object_id and c2.column_id=fkc.referenced_column_id 
+  inner join sys.tables t1 on t1.object_id=fkc.parent_object_id 
+  inner join sys.tables t2 on t2.object_id=fkc.referenced_object_id 
+  where object_name(fkc.parent_object_id) = @tablename;
+
+  
+--INSERT @Drop_Create(drop_script, create_script) SELECT @drop , @create;
+
+-- create is a little more complex. We need to generate the list of 
+-- columns on both sides of the constraint, even though in most cases
+-- there is only one column.
+SELECT @create += N'
+ALTER TABLE ' 
+   + QUOTENAME(cs.name) + '.' + QUOTENAME(ct.name) 
+   + '  WITH NOCHECK ADD CONSTRAINT ' + QUOTENAME(fk.name) 
+   + ' FOREIGN KEY (' + STUFF((SELECT ',' + QUOTENAME(c.name)
+   -- get all the columns in the constraint table
+    FROM sys.columns AS c 
+    INNER JOIN sys.foreign_key_columns AS fkc 
+    ON fkc.parent_column_id = c.column_id
+    AND fkc.parent_object_id = c.[object_id]
+    WHERE fkc.constraint_object_id = fk.[object_id]
+    ORDER BY fkc.constraint_column_id 
+    FOR XML PATH(N''), TYPE).value(N'.[1]', N'nvarchar(max)'), 1, 1, N'')
+  + ') REFERENCES ' + QUOTENAME(rs.name) + '.' + QUOTENAME(rt.name)
+  + '(' + STUFF((SELECT ',' + QUOTENAME(c.name)
+   -- get all the referenced columns
+    FROM sys.columns AS c 
+    INNER JOIN sys.foreign_key_columns AS fkc 
+    ON fkc.referenced_column_id = c.column_id
+    AND fkc.referenced_object_id = c.[object_id]
+    WHERE fkc.constraint_object_id = fk.[object_id]
+    ORDER BY fkc.constraint_column_id 
+    FOR XML PATH(N''), TYPE).value(N'.[1]', N'nvarchar(max)'), 1, 1, N'') + ');'
+
+         , @drop += N'
+ALTER TABLE ' 
+   + QUOTENAME(cs.name) + '.' + QUOTENAME(ct.name) 
+   + ' DROP CONSTRAINT ' + QUOTENAME(fk.name)  + ';'
+FROM sys.foreign_keys AS fk
+INNER JOIN sys.tables AS rt -- referenced table
+  ON fk.referenced_object_id = rt.[object_id]
+INNER JOIN sys.schemas AS rs 
+  ON rt.[schema_id] = rs.[schema_id]
+INNER JOIN sys.tables AS ct -- constraint table
+  ON fk.parent_object_id = ct.[object_id]
+INNER JOIN sys.schemas AS cs 
+  ON ct.[schema_id] = cs.[schema_id]
+WHERE rt.is_ms_shipped = 0 AND ct.is_ms_shipped = 0 and rt.name = @tablename
+
+INSERT @Drop_Create(drop_script, create_script) SELECT @drop , @create;
+
+select * from @Drop_Create
+       "
+$connString = "Server=$SrcServerName;Database=$DbName;Integrated Security=SSPI;"
+$dataAdapter.SelectCommand = new-object System.Data.SqlClient.SqlCommand ($Drop_Create_query,$connString)
+$commandBuilder = new-object System.Data.SqlClient.SqlCommandBuilder $dataAdapter
+$dt = New-Object System.Data.DataTable  
+[void]$dataAdapter.fill($dt)
+#Export Data
+$dt | Export-Csv $FileCreateDDL -NoTypeInformation 
+#Import Data for the Automation
+$Importdata = Import-CSV $FileCreateDDL
+$Drop_Fetch = $Importdata | select  drop_script 
+$Create_Fetch = $Importdata | select  create_script 
+[string]$Drop_SQL=  $Drop_Fetch.drop_script
+$global:Create_SQL = $Create_Fetch.create_script
+# Drop Constraints If there are any 
+Write-host "Removing FK constraints " $TbName
+Invoke-Sqlcmd -connectionstring "Data Source=$DesServerName;Initial Catalog=$DbName;Integrated Security=True;" -Query $Drop_SQL
+
+Clear-Variable -Name Drop_SQL,trimtable, dt, FileCreateDDL,  Importdata , Drop_Fetch
+}
+
+###########################################################################
+# Function Truncate_Tb : Truncate the table.
+# Parameters: ServerName , DbName and TbName
+###########################################################################
+
+Function Truncate_Tb ([string] $ServerName, [string] $DbName ,[string] $TbName)
+{
+$TruncateSql = "Use $DbName ; TRUNCATE TABLE " + $TbName
+Invoke-Sqlcmd -ConnectionString "Data Source=$ServerName;Initial Catalog=$DbName;Integrated Security=True;" -Query $TruncateSql
+}
+
+Function create_Fk_Constraints ([string] $ServerName, [string] $DbName ,[string] $TbName)
+{
+write-host $global:Create_SQL 
+Invoke-Sqlcmd -connectionstring "Data Source=$ServerName;Initial Catalog=$DbName;Integrated Security=True;" -Query $global:Create_SQL 
+Write-host "Creating FK constraints on " $TbName
+
+Clear-Variable -Name Create_SQL 
+}
+clear-host 
+$MasterServer = '<ServerName>'
+$MasterDatabase = "DPR"
+$MstdataAdapter = New-Object System.Data.SqlClient.SqlDataAdapter
+$MstrConnStr = "Server=$MasterServer;Database=$MasterDatabase;Integrated Security=SSPI;"
+$CmdText = "SELECT SrcServer,DestServer,DbName,TbName FROM dpr.common.RefreshTablesList"
+$MstdataAdapter.SelectCommand = new-object System.Data.SqlClient.SqlCommand ($CmdText,$MstrConnStr)
+$MstcommandBuilder = new-object System.Data.SqlClient.SqlCommandBuilder $MstdataAdapter
+$Mstdt = New-Object System.Data.DataTable  
+[void]$MstdataAdapter.fill($Mstdt)
+
+$Mstdt = $Mstdt | select  SrcServer,DestServer,DbName,TbName
+$tables = $Mstdt | Select TbName
+
+if ($tables.Rows.Count -gt 0  )
+{
+
+Foreach ($table in $tables){
+
+$Mstdatatable = $Mstdt | select  SrcServer,DestServer,DbName,TbName | where TbName -eq $table.TbName 
+$SrcServer=$Mstdatatable.SrcServer  
+$DestServer = $Mstdatatable.DestServer  
+$DbName=$Mstdatatable.DbName  
+$TbName=$Mstdatatable.TbName   
+
+##Calling Function Rm_Fk_Constraints
+write-host "Deleting FK constraints on: $($TbName)"
+Rm_Fk_Constraints -SrcServerName $SrcServer -DesServerName $DestServer -DbName $DbName -TbName $TbName
+#Truncate Destination table
+write-host "Truncating the destination table: $($TbName)"
+Truncate_Tb  -ServerName $DestServer -DbName $DbName -TbName $TbName
+#Fetching data from source table
+write-host "Fetching the Src Table data: $($TbName)"
+
+$SrcConnStr = ConnectionString -ServerName $SrcServer -DbName $DbName
+$SrcConn = New-Object System.Data.SqlClient.SQLConnection($SrcConnStr)
+$CmdText = "SELECT * FROM $TbName"
+$SqlCommand = New-Object system.Data.SqlClient.SqlCommand($CmdText, $SrcConn)
+$SrcConn.Open()
+[System.Data.SqlClient.SqlDataReader] $SqlReader = $SqlCommand.ExecuteReader()
+
+#Loading source data to destination table
+write-host "Loading the destination tables: $TbName"
+Try
+{
+$DestConnStr = ConnectionString $DestServer $DbName
+#Testing @local Lap $DestConnStr = ConnectionString $t1.DestServer "AdventureWorks"
+$bulkCopy = New-Object Data.SqlClient.SqlBulkCopy($DestConnStr, [System.Data.SqlClient.SqlBulkCopyOptions]::KeepIdentity)
+$bulkCopy.DestinationTableName = $TbName
+$bulkCopy.WriteToServer($sqlReader)
+}
+Catch [System.Exception]
+{
+$ex = $_.Exception
+Write-Host $ex.Message
+}
+
+Clear-Variable -Name TbName 
+ 
+Write-host "Creating FK constraints on: $TbName"
+create_Fk_Constraints  -ServerName $DestServer -DbName $DbName -TbName $TbName
+}
+Clear-Variable -Name TbName  
+}
+
+else
+
+{
+write-host "Table is empty in DPR"
+} 
